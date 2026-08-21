@@ -7,6 +7,11 @@ RSpec.describe "Homes", type: :request do
         get "/home/index"
         expect(response).to have_http_status(:success)
       end
+
+      it "displays the Quick Access section title" do
+        get "/home/index"
+        expect(response.body).to include("Where would you like to go?")
+      end
     end
 
     context "when authenticated" do
