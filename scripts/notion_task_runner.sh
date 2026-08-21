@@ -210,10 +210,10 @@ EOF
 )" 2>&1 | grep "https://github.com" | tail -1)
 
 if [ -z "$PR_URL" ]; then
-  log "Warning: PR may have been created but URL was not captured. Check GitHub."
-else
-  log "Opened PR: $PR_URL"
+  fail_task "$TASK_ID" "$BRANCH" "Code was committed and pushed to $BRANCH but gh pr create failed — open the PR manually."
+  exit 1
 fi
+log "Opened PR: $PR_URL"
 
 # Post Notion comment if tests failed
 if [ "$TESTS_PASSING" = false ]; then
