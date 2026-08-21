@@ -16,28 +16,26 @@ log() {
 }
 
 notion_patch() {
-  curl -s -X PATCH "https://api.notion.com/v1/pages/$1" \
+  local result
+  result=$(curl -s -X PATCH "https://api.notion.com/v1/pages/$1" \
     -H "Authorization: Bearer $NOTION_TOKEN" \
     -H "Notion-Version: 2022-06-28" \
     -H "Content-Type: application/json" \
-    --data "$2" > /dev/null
-}
-
-notion_comment() {
-  local message
-  message=$(echo "$2" | sed 's/"/\\"/g')
-  curl -s -X POST "https://api.notion.com/v1/comments" \
-    -H "Authorization: Bearer $NOTION_TOKEN" \
-    -H "Notion-Version: 2022-06-28" \
-    -H "Content-Type: application/json" \
-    --data "{\"parent\": {\"page_id\": \"$1\"}, \"rich_text\": [{\"type\": \"text\", \"text\": {\"content\": \"$message\"}}]}" > /dev/null
+    --data "$2")
+  if echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d.get('object')!='error' else 1)" 2>/dev/null; then
+    :
+  else
+    log "Notion PATCH failed: $result"
+  fi
 }
 
 fail_task() {
   local task_id="$1" branch="$2" reason="$3"
   log "Task failed: $reason"
-  notion_comment "$task_id" "⚠️ Claude couldn't complete this task: $reason — Please clarify the requirements and reset the status to 'Not started'."
-  notion_patch "$task_id" '{"properties": {"Status": {"status": {"name": "Not started"}}}}'
+  # Write reason into the Description field so it's visible without comment permissions
+  local escaped_reason
+  escaped_reason=$(echo "$reason" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  notion_patch "$task_id" "{\"properties\": {\"Status\": {\"status\": {\"name\": \"Not started\"}}, \"Description\": {\"rich_text\": [{\"type\": \"text\", \"text\": {\"content\": \"⚠️ Claude couldn't complete this task: $escaped_reason — Please clarify the requirements and try again.\"}}]}}}"
   if [ -n "$branch" ] && git show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
     git checkout main 2>/dev/null || true
     git branch -D "$branch" 2>/dev/null || true
