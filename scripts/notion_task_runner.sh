@@ -109,21 +109,27 @@ Name: $TASK_NAME
 Description: $TASK_DESC
 
 ## Your job
-You are already on branch $BRANCH. Make the necessary code changes to fulfill the task requirements, then verify with the test suite.
+You are already on branch $BRANCH. Make the necessary code changes to fulfill the task requirements, write tests, and run the full test suite.
 
 - Read relevant files first to understand the codebase
 - Rails 7.1 with Hotwire (Turbo + Stimulus) and Bootstrap
 - Only change what the task description asks for — no unrelated refactoring
-- Run: bundle exec rspec
-- Fix any test failures caused by your changes before signaling success
+- Write RSpec tests covering the new behaviour (add to the appropriate spec file or create a new one)
+- Run the full suite: bundle exec rspec
+- Attempt to fix any test failures caused by your changes (up to 2 retries)
 
-## When finished, write your result to $RESULT_FILE
+## When finished, write your result to $RESULT_FILE as JSON
 
-On success (changes made, tests pass):
-  Write: {\"status\": \"success\"}
+Three possible outcomes:
 
-On failure (task is too vague to act on, can't determine what to change, tests won't pass after reasonable attempts):
-  Write: {\"status\": \"failed\", \"reason\": \"one concise sentence explaining the problem\"}
+1. Implementation done and all tests pass:
+   {\"status\": \"success\", \"tests\": \"passing\"}
+
+2. Implementation done but tests are still failing after attempts to fix:
+   {\"status\": \"tests_failing\", \"reason\": \"one sentence describing what is failing and why\"}
+
+3. Cannot implement — task too vague, can't determine what to change:
+   {\"status\": \"failed\", \"reason\": \"one concise sentence explaining the problem\"}
 
 IMPORTANT: Do NOT git add, commit, push, or open PRs — the calling script handles that.
 IMPORTANT: You MUST write to $RESULT_FILE before exiting, even on failure." >> "$LOG_FILE" 2>&1
@@ -137,7 +143,7 @@ fi
 STATUS=$(python3 -c "import json; d=json.load(open('$RESULT_FILE')); print(d.get('status','unknown'))" 2>/dev/null || echo "unknown")
 REASON=$(python3 -c "import json; d=json.load(open('$RESULT_FILE')); print(d.get('reason',''))" 2>/dev/null || echo "")
 
-if [ "$STATUS" != "success" ]; then
+if [ "$STATUS" = "failed" ]; then
   fail_task "$TASK_ID" "$BRANCH" "${REASON:-Implementation failed without a stated reason.}"
   exit 1
 fi
@@ -159,9 +165,32 @@ EOF
 git push origin "$BRANCH"
 log "Committed and pushed $BRANCH"
 
+TESTS_PASSING=true
+PR_FLAGS=""
+PR_TITLE="$TASK_NAME"
+TEST_NOTICE=""
+
+if [ "$STATUS" = "tests_failing" ]; then
+  TESTS_PASSING=false
+  PR_FLAGS="--draft"
+  PR_TITLE="[TESTS FAILING] $TASK_NAME"
+  TEST_NOTICE="$(cat <<EOF
+
+---
+> ⚠️ **Tests are failing.** Claude implemented this change but could not get the test suite to pass.
+>
+> Reason: ${REASON:-not specified}
+>
+> This PR is a **draft** — review the failing tests before merging.
+EOF
+)"
+  log "Tests failing — opening draft PR"
+fi
+
 # Open PR and capture URL
 PR_URL=$(gh pr create \
-  --title "$TASK_NAME" \
+  $PR_FLAGS \
+  --title "$PR_TITLE" \
   --body "$(cat <<EOF
 ## Summary
 $(git diff main.."$BRANCH" --stat | tail -1)
@@ -172,6 +201,7 @@ ${TASK_DESC:-No description provided.}
 ## Test plan
 - [ ] Verify the change matches the task description
 - [ ] Run \`bundle exec rspec\`
+$TEST_NOTICE
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
@@ -181,6 +211,11 @@ if [ -z "$PR_URL" ]; then
   log "Warning: PR may have been created but URL was not captured. Check GitHub."
 else
   log "Opened PR: $PR_URL"
+fi
+
+# Post Notion comment if tests failed
+if [ "$TESTS_PASSING" = false ]; then
+  notion_comment "$TASK_ID" "⚠️ Tests failing: ${REASON:-see PR for details}. A draft PR has been opened at $PR_URL — review the failures before merging."
 fi
 
 # Update Notion with branch and PR URL
