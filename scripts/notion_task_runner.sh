@@ -1,9 +1,7 @@
 #!/bin/bash
 # Polls the Enthasys Tasks Notion database for "Not started" tasks
 # and invokes Claude to implement them as GitHub PRs.
-# Intended to run via cron every hour.
-
-set -e
+# Intended to run via cron daily or manually.
 
 PROJECT_DIR="/Users/chadwickbidwell/workspace/projects/enthasys"
 NOTION_TOKEN="${NOTION_TOKEN:-$(grep NOTION_TOKEN "$PROJECT_DIR/.env" 2>/dev/null | cut -d '=' -f2)}"
@@ -11,9 +9,40 @@ TASKS_DB_ID="3c2f755b-9b20-8057-b1de-f2eade923adb"
 CLAUDE_BIN="/Users/chadwickbidwell/.local/bin/claude"
 LOG_FILE="$PROJECT_DIR/log/notion_task_runner.log"
 LOCK_FILE="$PROJECT_DIR/tmp/notion_task_runner.lock"
+RESULT_FILE="$PROJECT_DIR/tmp/task_result.json"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+notion_patch() {
+  curl -s -X PATCH "https://api.notion.com/v1/pages/$1" \
+    -H "Authorization: Bearer $NOTION_TOKEN" \
+    -H "Notion-Version: 2022-06-28" \
+    -H "Content-Type: application/json" \
+    --data "$2" > /dev/null
+}
+
+notion_comment() {
+  local message
+  message=$(echo "$2" | sed 's/"/\\"/g')
+  curl -s -X POST "https://api.notion.com/v1/comments" \
+    -H "Authorization: Bearer $NOTION_TOKEN" \
+    -H "Notion-Version: 2022-06-28" \
+    -H "Content-Type: application/json" \
+    --data "{\"parent\": {\"page_id\": \"$1\"}, \"rich_text\": [{\"type\": \"text\", \"text\": {\"content\": \"$message\"}}]}" > /dev/null
+}
+
+fail_task() {
+  local task_id="$1" branch="$2" reason="$3"
+  log "Task failed: $reason"
+  notion_comment "$task_id" "⚠️ Claude couldn't complete this task: $reason — Please clarify the requirements and reset the status to 'Not started'."
+  notion_patch "$task_id" '{"properties": {"Status": {"status": {"name": "Not started"}}}}'
+  if [ -n "$branch" ] && git show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+    git checkout main 2>/dev/null || true
+    git branch -D "$branch" 2>/dev/null || true
+    log "Cleaned up branch $branch"
+  fi
 }
 
 # Prevent overlapping runs
@@ -54,80 +83,107 @@ fi
 
 log "Picked up task: $TASK_NAME (ID: $TASK_ID)"
 
-cd "$PROJECT_DIR"
+# Derive branch name
+BRANCH="task/$(echo "$TASK_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-\|-$//g')"
 
-"$CLAUDE_BIN" --dangerously-skip-permissions -p "You are implementing a task for the Enthasys Rails 7.1 project located at /Users/chadwickbidwell/workspace/projects/enthasys.
+# Mark In progress immediately to prevent duplicate pickup
+notion_patch "$TASK_ID" '{"properties": {"Status": {"status": {"name": "In progress"}}}}'
+log "Marked In progress in Notion"
+
+# Create branch from latest main
+cd "$PROJECT_DIR"
+if ! git checkout main && git pull origin main && git checkout -b "$BRANCH"; then
+  fail_task "$TASK_ID" "" "Failed to create branch $BRANCH — check for conflicts or a duplicate branch name."
+  exit 1
+fi
+log "Created branch $BRANCH"
+
+# Clear any previous result file
+rm -f "$RESULT_FILE"
+
+# Invoke Claude for implementation only — shell handles all git/Notion ops
+"$CLAUDE_BIN" --dangerously-skip-permissions -p "You are implementing a code change for the Enthasys Rails 7.1 app at /Users/chadwickbidwell/workspace/projects/enthasys.
 
 ## Task
 Name: $TASK_NAME
 Description: $TASK_DESC
-Notion page ID: $TASK_ID
 
-## Your workflow — follow these steps in order
+## Your job
+You are already on branch $BRANCH. Make the necessary code changes to fulfill the task requirements, then verify with the test suite.
 
-### 1. Mark task In progress in Notion
-Run:
-curl -s -X PATCH 'https://api.notion.com/v1/pages/$TASK_ID' \
-  -H 'Authorization: Bearer $NOTION_TOKEN' \
-  -H 'Notion-Version: 2022-06-28' \
-  -H 'Content-Type: application/json' \
-  --data '{\"properties\": {\"Status\": {\"status\": {\"name\": \"In progress\"}}}}'
+- Read relevant files first to understand the codebase
+- Rails 7.1 with Hotwire (Turbo + Stimulus) and Bootstrap
+- Only change what the task description asks for — no unrelated refactoring
+- Run: bundle exec rspec
+- Fix any test failures caused by your changes before signaling success
 
-### 2. Create a branch
-- Slugify the task name: lowercase, spaces to hyphens, remove special chars
-- Branch format: task/<slug>
-- Run: git checkout main && git pull origin main && git checkout -b task/<slug>
+## When finished, write your result to $RESULT_FILE
 
-### 3. Implement the task
-- Read the relevant files to understand the codebase
-- Make the necessary code changes to fulfill the task requirements
-- This is a Rails 7.1 app with Hotwire (Turbo + Stimulus) and Bootstrap
-- Do not refactor unrelated code
+On success (changes made, tests pass):
+  Write: {\"status\": \"success\"}
 
-### 4. Run tests
-Run: bundle exec rspec
-Fix any test failures caused by your changes before proceeding.
+On failure (task is too vague to act on, can't determine what to change, tests won't pass after reasonable attempts):
+  Write: {\"status\": \"failed\", \"reason\": \"one concise sentence explaining the problem\"}
 
-### 5. Commit and push
-Run:
+IMPORTANT: Do NOT git add, commit, push, or open PRs — the calling script handles that.
+IMPORTANT: You MUST write to $RESULT_FILE before exiting, even on failure." >> "$LOG_FILE" 2>&1
+
+# Check result file
+if [ ! -f "$RESULT_FILE" ]; then
+  fail_task "$TASK_ID" "$BRANCH" "Claude exited without writing a result — likely a timeout or crash."
+  exit 1
+fi
+
+STATUS=$(python3 -c "import json; d=json.load(open('$RESULT_FILE')); print(d.get('status','unknown'))" 2>/dev/null || echo "unknown")
+REASON=$(python3 -c "import json; d=json.load(open('$RESULT_FILE')); print(d.get('reason',''))" 2>/dev/null || echo "")
+
+if [ "$STATUS" != "success" ]; then
+  fail_task "$TASK_ID" "$BRANCH" "${REASON:-Implementation failed without a stated reason.}"
+  exit 1
+fi
+
+# Check there are actually changes to commit
+if git diff --quiet && git diff --cached --quiet; then
+  fail_task "$TASK_ID" "$BRANCH" "Claude signaled success but made no code changes."
+  exit 1
+fi
+
+# Commit and push
 git add -A
-git commit -m \"\$(cat <<'EOF'
+git commit -m "$(cat <<EOF
 task: $TASK_NAME
 
 Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
 EOF
-)\"
-git push origin task/<slug>
+)"
+git push origin "$BRANCH"
+log "Committed and pushed $BRANCH"
 
-### 6. Open a PR
-Run:
-gh pr create --title \"$TASK_NAME\" --body \"\$(cat <<'EOF'
+# Open PR and capture URL
+PR_URL=$(gh pr create \
+  --title "$TASK_NAME" \
+  --body "$(cat <<EOF
 ## Summary
-<bullet points of what changed>
+$(git diff main.."$BRANCH" --stat | tail -1)
 
 ## Notion Task
-$TASK_DESC
+${TASK_DESC:-No description provided.}
 
 ## Test plan
-<checklist of what to verify>
+- [ ] Verify the change matches the task description
+- [ ] Run \`bundle exec rspec\`
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
-)\"
+)" 2>&1 | grep "https://github.com" | tail -1)
 
-Capture the PR URL from the output.
+if [ -z "$PR_URL" ]; then
+  log "Warning: PR may have been created but URL was not captured. Check GitHub."
+else
+  log "Opened PR: $PR_URL"
+fi
 
-### 7. Update Notion with branch and PR URL
-Run:
-curl -s -X PATCH 'https://api.notion.com/v1/pages/$TASK_ID' \
-  -H 'Authorization: Bearer $NOTION_TOKEN' \
-  -H 'Notion-Version: 2022-06-28' \
-  -H 'Content-Type: application/json' \
-  --data '{\"properties\": {\"Branch\": {\"rich_text\": [{\"type\": \"text\", \"text\": {\"content\": \"task/<slug>\"}}]}, \"PR URL\": {\"url\": \"<pr_url>\"}}}'
-
-## Rules
-- Only implement what the task description says
-- Never push to main
-- If you cannot implement the task, revert the Notion status to 'Not started' and stop" >> "$LOG_FILE" 2>&1
-
-log "Claude finished for task: $TASK_NAME"
+# Update Notion with branch and PR URL
+notion_patch "$TASK_ID" "{\"properties\": {\"Branch\": {\"rich_text\": [{\"type\": \"text\", \"text\": {\"content\": \"$BRANCH\"}}]}, \"PR URL\": {\"url\": \"$PR_URL\"}}}"
+log "Updated Notion with branch and PR URL"
+log "Done."
