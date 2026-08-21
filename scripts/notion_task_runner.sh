@@ -33,6 +33,11 @@ TASK_ID=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin)
 TASK_NAME=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); t=d['results'][0]['properties']['Name']['title']; print(t[0]['plain_text'] if t else '')")
 TASK_DESC=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); rt=d['results'][0]['properties']['Description']['rich_text']; print(rt[0]['plain_text'] if rt else '')")
 
+if [ -z "$TASK_NAME" ]; then
+  log "Skipping unnamed task (ID: $TASK_ID) — add a Name in Notion."
+  exit 0
+fi
+
 log "Picked up task: $TASK_NAME (ID: $TASK_ID)"
 
 cd "$PROJECT_DIR"
