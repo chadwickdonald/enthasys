@@ -92,10 +92,10 @@ log "Marked In progress in Notion"
 
 # Create branch from latest main
 cd "$PROJECT_DIR"
-if ! git checkout main && git pull origin main && git checkout -b "$BRANCH"; then
+git checkout main && git pull origin main && git checkout -b "$BRANCH" || {
   fail_task "$TASK_ID" "" "Failed to create branch $BRANCH — check for conflicts or a duplicate branch name."
   exit 1
-fi
+}
 log "Created branch $BRANCH"
 
 # Clear any previous result file
@@ -154,8 +154,10 @@ if git diff --quiet && git diff --cached --quiet; then
   exit 1
 fi
 
-# Commit and push
-git add -A
+# Commit and push — only stage modifications to tracked files plus new files
+# in app-relevant directories; never sweep in untracked top-level dirs
+git add -u
+git add app/ spec/ config/ db/ lib/ Gemfile Gemfile.lock 2>/dev/null || true
 git commit -m "$(cat <<EOF
 task: $TASK_NAME
 
