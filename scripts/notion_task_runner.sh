@@ -10,10 +10,24 @@ NOTION_TOKEN="${NOTION_TOKEN:-$(grep NOTION_TOKEN "$PROJECT_DIR/.env" 2>/dev/nul
 TASKS_DB_ID="3c2f755b-9b20-8057-b1de-f2eade923adb"
 CLAUDE_BIN="/Users/chadwickbidwell/.local/bin/claude"
 LOG_FILE="$PROJECT_DIR/log/notion_task_runner.log"
+LOCK_FILE="$PROJECT_DIR/tmp/notion_task_runner.lock"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
+
+# Prevent overlapping runs
+if [ -f "$LOCK_FILE" ]; then
+  LOCK_PID=$(cat "$LOCK_FILE" 2>/dev/null)
+  if kill -0 "$LOCK_PID" 2>/dev/null; then
+    log "Another run is active (PID $LOCK_PID). Exiting."
+    exit 0
+  else
+    log "Stale lock found (PID $LOCK_PID no longer running). Continuing."
+  fi
+fi
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
 
 # Query Notion for the first "Not started" task
 RESPONSE=$(curl -s -X POST "https://api.notion.com/v1/databases/$TASKS_DB_ID/query" \
